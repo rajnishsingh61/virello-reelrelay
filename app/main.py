@@ -195,23 +195,56 @@ def buffer_channels():
 
 # ----------------------------------------------------------- step 1: fetch
 def catbox_upload(path: Path) -> str:
-    """Upload a local MP4 to Catbox and return its stable public file URL."""
+    """Upload a local MP4 to Catbox, verify the public URL is reachable, return it."""
     if path.stat().st_size > MAX_VIDEO_BYTES:
         raise HTTPException(413, "Video 200 MB se badi hai; Catbox upload limit ke andar wali file use karo.")
-    try:
+
+    def _do_upload() -> str:
         with open(path, "rb") as f:
-            r = httpx.post("https://catbox.moe/user/api.php",
-                           data={"reqtype": "fileupload"},
-                           files={"fileToUpload": (path.name, f, "video/mp4")}, timeout=300)
+            r = httpx.post(
+                "https://catbox.moe/user/api.php",
+                data={"reqtype": "fileupload"},
+                files={"fileToUpload": (path.name, f, "video/mp4")},
+                timeout=300,
+            )
         r.raise_for_status()
         public_url = r.text.strip()
         if not public_url.startswith("https://files.catbox.moe/"):
             raise RuntimeError(public_url[:300] or "Catbox ne public file URL nahi diya.")
         return public_url
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(502, f"Catbox upload fail hua: {str(e)[:250]}")
+
+    def _verify(url: str) -> bool:
+        """Confirm Buffer will be able to read the file."""
+        try:
+            # short delay so Catbox can finish propagating the file
+            time.sleep(2.5)
+            h = httpx.head(url, headers=UA, timeout=20, follow_redirects=True)
+            if h.status_code >= 400:
+                # some CDNs block HEAD; try a tiny range GET
+                g = httpx.get(url, headers={**UA, "Range": "bytes=0-1023"}, timeout=20, follow_redirects=True)
+                if g.status_code >= 400:
+                    return False
+                ctype = (g.headers.get("content-type") or "").lower()
+            else:
+                ctype = (h.headers.get("content-type") or "").lower()
+            # accept any video/* or octet-stream (Catbox sometimes returns the latter)
+            return ("video" in ctype) or ("octet-stream" in ctype) or ctype == ""
+        except Exception:
+            return False
+
+    last_err = None
+    for attempt in range(1, 3):  # try up to 2 times
+        try:
+            public_url = _do_upload()
+            if _verify(public_url):
+                return public_url
+            last_err = f"Catbox URL verify fail (attempt {attempt}): {public_url}"
+        except Exception as e:
+            last_err = str(e)[:250]
+        if attempt < 2:
+            time.sleep(1.5)
+
+    raise HTTPException(502, f"Catbox upload/verify fail hua: {last_err}")
 
 
 @app.post("/api/fetch")
