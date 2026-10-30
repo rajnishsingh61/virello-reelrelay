@@ -143,7 +143,7 @@ class PublishIn(BaseModel):
     youtube: bool = False
     instagram_channel_id: str | None = None
     youtube_channel_id: str | None = None
-    scheduling_mode: str = "queue"  # queue | now
+    scheduling_mode: str = "now"  # now = direct publish | queue
     rights_confirmed: bool = False
 
 
