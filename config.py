@@ -32,5 +32,5 @@ TIMEZONE = "Asia/Kolkata"
 
 # Public base URL of this app (Render URL). Example: https://virello-xxxx.onrender.com
 # Required so Buffer can download the video from your own server instead of Catbox.
-PUBLIC_BASE_URL = ""
+PUBLIC_BASE_URL = "https://virello-reelrelay.onrender.com"
 
