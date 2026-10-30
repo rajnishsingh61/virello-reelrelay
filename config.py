@@ -7,7 +7,7 @@ SECRET_KEY = "HXHHDDDEO6DO6DO6DOYDOYDKXK"
 # Caption generation (OpenRouter or any OpenAI-compatible API)
 LLM_API_KEY = "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"
 LLM_BASE_URL = "https://openrouter.ai/api/v1"
-LLM_MODEL = "openrouter/free"
+LLM_MODEL = "google/gemma-4-31b-it:free"
 BRAND_NAME = "Virello"
 
 BRAND_VOICE = """

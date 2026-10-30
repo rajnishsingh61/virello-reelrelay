@@ -4,6 +4,7 @@ import hmac
 import json
 import re
 import sys
+import subprocess
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -197,6 +198,26 @@ def buffer_channels():
 
 
 # ----------------------------------------------------------- step 1: fetch
+
+def reencode_for_reels(src: Path, dest: Path) -> None:
+    """Force max 60 fps + H.264/AAC so Instagram Reels accepts the file."""
+    cmd = [
+        "ffmpeg", "-y", "-i", str(src),
+        "-vf", "fps=60",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(dest),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if proc.returncode != 0 or not dest.exists() or dest.stat().st_size == 0:
+            # fallback: just copy if ffmpeg fails
+            dest.write_bytes(src.read_bytes())
+    except Exception:
+        dest.write_bytes(src.read_bytes())
+
+
 def public_media_url(job_id: str, request: Request | None = None) -> str:
     """Build a public URL that Buffer can fetch (self-hosted on this app)."""
     base = cfg("PUBLIC_BASE_URL").rstrip("/")
@@ -248,6 +269,7 @@ def fetch_video(body: UrlIn, request: Request):
             params={"url": m.group(0), "hd": "1"},
             headers={**UA, "x-tikwmapi-key": tikwm_key, "Accept": "application/json"},
             timeout=60,
+            verify=False,
         )
         if r.status_code == 429:
             raise HTTPException(429, "TikWM rate limit/quota reached. Thodi der baad try karo ya plan quota check karo.")
@@ -272,28 +294,34 @@ def fetch_video(body: UrlIn, request: Request):
         src = "https://www.tikwm.com" + src
 
     job_id = uuid.uuid4().hex[:10]
+    raw_path = MEDIA / f"{job_id}_raw.mp4"
     path = MEDIA / f"{job_id}.mp4"
     size = 0
     try:
-        with httpx.stream("GET", src, headers=UA, timeout=180, follow_redirects=True) as resp:
+        # verify=False: some TikTok CDN certs cause CERTIFICATE_VERIFY_FAILED on Render
+        with httpx.stream("GET", src, headers=UA, timeout=180, follow_redirects=True, verify=False) as resp:
             resp.raise_for_status()
             content_length = int(resp.headers.get("content-length") or 0)
             if content_length > MAX_VIDEO_BYTES:
-                raise HTTPException(413, "Video 200 MB se badi hai; Catbox limit ke andar wali video use karo.")
-            with open(path, "wb") as f:
+                raise HTTPException(413, "Video 200 MB se badi hai.")
+            with open(raw_path, "wb") as f:
                 for chunk in resp.iter_bytes():
                     size += len(chunk)
                     if size > MAX_VIDEO_BYTES:
-                        raise HTTPException(413, "Video 200 MB se badi hai; Catbox limit ke andar wali video use karo.")
+                        raise HTTPException(413, "Video 200 MB se badi hai.")
                     f.write(chunk)
         if size == 0:
             raise RuntimeError("Downloaded file khaali hai.")
-        # Prefer self-hosted public URL (Buffer reads from our Render server)
+        # Re-encode to max 60 fps + H.264 so Instagram Reels accepts it
+        reencode_for_reels(raw_path, path)
+        raw_path.unlink(missing_ok=True)
         public_url = public_media_url(job_id, request)
     except HTTPException:
+        raw_path.unlink(missing_ok=True)
         path.unlink(missing_ok=True)
         raise
     except Exception as e:
+        raw_path.unlink(missing_ok=True)
         path.unlink(missing_ok=True)
         raise HTTPException(502, f"Download fail hua: {str(e)[:250]}")
 
@@ -436,6 +464,16 @@ def publish(body: PublishIn, background: BackgroundTasks):
 
 
 @app.get("/api/jobs/{job_id}")
+
+@app.post("/api/delete")
+def delete_job(body: JobIn):
+    """Delete a job and its local video file."""
+    job = JOBS.pop(body.job_id, None)
+    for suffix in ("", "_raw"):
+        (MEDIA / f"{body.job_id}{suffix}.mp4").unlink(missing_ok=True)
+    return {"ok": True, "deleted": body.job_id if job else None}
+
+
 def job_status(job_id: str):
     return get_job(job_id)
 
