@@ -29,3 +29,8 @@ TIKWMAPI_KEY = "35669dccb6b831cad622bb67b3a0ea40"
 BUFFER_API_KEY = "bVVbl1tyFfSVYtnfap5E8Y1HVSRf03_XxOmFGPp75kT"
 BUFFER_YOUTUBE_PRIVACY = "public"  # public | unlisted | private
 TIMEZONE = "Asia/Kolkata"
+
+# Public base URL of this app (Render URL). Example: https://virello-xxxx.onrender.com
+# Required so Buffer can download the video from your own server instead of Catbox.
+PUBLIC_BASE_URL = ""
+

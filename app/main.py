@@ -26,8 +26,8 @@ MEDIA.mkdir(exist_ok=True)
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 TIKTOK_RE = re.compile(r"https?://\S*tiktok\.com\S*", re.I)
-MEDIA_MAX_AGE = 3600  # local preview files auto-delete after one hour
-MAX_VIDEO_BYTES = 200 * 1024 * 1024  # Catbox upload limit guard
+MEDIA_MAX_AGE = 6 * 3600  # keep local files up to 6h so Buffer can fetch them
+MAX_VIDEO_BYTES = 200 * 1024 * 1024  # safety limit for local storage
 
 JOBS: dict[str, dict] = {}  # in-memory (server restart par reset)
 FAILS: dict[str, list] = {}  # login rate-limit
@@ -89,7 +89,10 @@ OPEN_PATHS = {"/api/auth", "/api/login"}
 @app.middleware("http")
 async def guard(request: Request, call_next):
     p = request.url.path
-    if (p.startswith("/api/") or p.startswith("/media/")) and p not in OPEN_PATHS:
+    # /media/* must stay public so Buffer can download the video without login
+    if p.startswith("/media/"):
+        return await call_next(request)
+    if p.startswith("/api/") and p not in OPEN_PATHS:
         if not is_logged_in(request):
             return JSONResponse({"detail": "Pehle login karo."}, status_code=401)
     return await call_next(request)
@@ -156,7 +159,7 @@ def config_status():
         "llm": bool(cfg("LLM_API_KEY")),
         "buffer_key": buffer_ready(),
         "tikwm_key": bool(cfg("TIKWMAPI_KEY")),
-        "catbox": True,
+        "self_hosted_media": True, "public_base_url": bool(cfg("PUBLIC_BASE_URL")),
         "publishing_provider": "buffer",
     }
 
@@ -194,61 +197,44 @@ def buffer_channels():
 
 
 # ----------------------------------------------------------- step 1: fetch
+def public_media_url(job_id: str, request: Request | None = None) -> str:
+    """Build a public URL that Buffer can fetch (self-hosted on this app)."""
+    base = cfg("PUBLIC_BASE_URL").rstrip("/")
+    if not base and request is not None:
+        # Auto-detect from incoming request (works on Render)
+        proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "https"
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+        if host:
+            base = f"{proto}://{host}".rstrip("/")
+    if not base:
+        raise HTTPException(
+            400,
+            "config.py mein PUBLIC_BASE_URL set karo (apna Render URL). "
+            "Example: https://virello-xxxx.onrender.com"
+        )
+    return f"{base}/media/{job_id}.mp4"
+
+
 def catbox_upload(path: Path) -> str:
-    """Upload a local MP4 to Catbox, verify the public URL is reachable, return it."""
+    """Optional fallback: upload to Catbox if needed. Prefer public_media_url instead."""
     if path.stat().st_size > MAX_VIDEO_BYTES:
-        raise HTTPException(413, "Video 200 MB se badi hai; Catbox upload limit ke andar wali file use karo.")
-
-    def _do_upload() -> str:
-        with open(path, "rb") as f:
-            r = httpx.post(
-                "https://catbox.moe/user/api.php",
-                data={"reqtype": "fileupload"},
-                files={"fileToUpload": (path.name, f, "video/mp4")},
-                timeout=300,
-            )
-        r.raise_for_status()
-        public_url = r.text.strip()
-        if not public_url.startswith("https://files.catbox.moe/"):
-            raise RuntimeError(public_url[:300] or "Catbox ne public file URL nahi diya.")
-        return public_url
-
-    def _verify(url: str) -> bool:
-        """Confirm Buffer will be able to read the file."""
-        try:
-            # short delay so Catbox can finish propagating the file
-            time.sleep(2.5)
-            h = httpx.head(url, headers=UA, timeout=20, follow_redirects=True)
-            if h.status_code >= 400:
-                # some CDNs block HEAD; try a tiny range GET
-                g = httpx.get(url, headers={**UA, "Range": "bytes=0-1023"}, timeout=20, follow_redirects=True)
-                if g.status_code >= 400:
-                    return False
-                ctype = (g.headers.get("content-type") or "").lower()
-            else:
-                ctype = (h.headers.get("content-type") or "").lower()
-            # accept any video/* or octet-stream (Catbox sometimes returns the latter)
-            return ("video" in ctype) or ("octet-stream" in ctype) or ctype == ""
-        except Exception:
-            return False
-
-    last_err = None
-    for attempt in range(1, 3):  # try up to 2 times
-        try:
-            public_url = _do_upload()
-            if _verify(public_url):
-                return public_url
-            last_err = f"Catbox URL verify fail (attempt {attempt}): {public_url}"
-        except Exception as e:
-            last_err = str(e)[:250]
-        if attempt < 2:
-            time.sleep(1.5)
-
-    raise HTTPException(502, f"Catbox upload/verify fail hua: {last_err}")
+        raise HTTPException(413, "Video 200 MB se badi hai.")
+    with open(path, "rb") as f:
+        r = httpx.post(
+            "https://catbox.moe/user/api.php",
+            data={"reqtype": "fileupload"},
+            files={"fileToUpload": (path.name, f, "video/mp4")},
+            timeout=300,
+        )
+    r.raise_for_status()
+    public_url = r.text.strip()
+    if not public_url.startswith("https://files.catbox.moe/"):
+        raise RuntimeError(public_url[:300] or "Catbox ne public file URL nahi diya.")
+    return public_url
 
 
 @app.post("/api/fetch")
-def fetch_video(body: UrlIn):
+def fetch_video(body: UrlIn, request: Request):
     cleanup_media()
     m = TIKTOK_RE.fullmatch(body.url.strip())
     if not m:
@@ -302,13 +288,14 @@ def fetch_video(body: UrlIn):
                     f.write(chunk)
         if size == 0:
             raise RuntimeError("Downloaded file khaali hai.")
-        public_url = catbox_upload(path)
+        # Prefer self-hosted public URL (Buffer reads from our Render server)
+        public_url = public_media_url(job_id, request)
     except HTTPException:
         path.unlink(missing_ok=True)
         raise
     except Exception as e:
         path.unlink(missing_ok=True)
-        raise HTTPException(502, f"Download/upload fail hua: {str(e)[:250]}")
+        raise HTTPException(502, f"Download fail hua: {str(e)[:250]}")
 
     author = data.get("author") or {}
     job = {"id": job_id, "title": data.get("title") or "", "creator": author.get("unique_id") or "",
