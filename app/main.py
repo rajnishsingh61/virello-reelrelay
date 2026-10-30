@@ -326,7 +326,7 @@ def buffer_create_video_post(channel_id: str, service: str, video_url: str, capt
         privacy = cfg("BUFFER_YOUTUBE_PRIVACY", "public").lower()
         if privacy not in {"public", "private", "unlisted"}:
             privacy = "public"
-        metadata = ("metadata: { youtube: { type: short, title: %s, privacy: %s, categoryId: \"22\", "
+        metadata = ("metadata: { youtube: { title: %s, privacy: %s, categoryId: \"22\", "
                     "notifySubscribers: true, madeForKids: false } }" %
                     (json.dumps(clean_title, ensure_ascii=False), privacy))
     else:
