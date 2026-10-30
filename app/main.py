@@ -27,7 +27,7 @@ MEDIA.mkdir(exist_ok=True)
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 TIKTOK_RE = re.compile(r"https?://\S*tiktok\.com\S*", re.I)
-MEDIA_MAX_AGE = 6 * 3600  # keep local files up to 6h so Buffer can fetch them
+MEDIA_MAX_AGE = 24 * 3600  # keep local files up to 24h for file manager list
 MAX_VIDEO_BYTES = 200 * 1024 * 1024  # safety limit for local storage
 
 JOBS: dict[str, dict] = {}  # in-memory (server restart par reset)
@@ -464,6 +464,73 @@ def publish(body: PublishIn, background: BackgroundTasks):
 
 
 @app.get("/api/jobs/{job_id}")
+
+
+@app.get("/api/videos")
+def list_videos():
+    """File-manager style list of local videos still on disk."""
+    cleanup_media()
+    items = []
+    for f in sorted(MEDIA.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if f.name.endswith("_raw.mp4"):
+            continue
+        job_id = f.stem
+        st = f.stat()
+        job = JOBS.get(job_id) or {}
+        items.append({
+            "id": job_id,
+            "filename": f.name,
+            "size": st.st_size,
+            "size_mb": round(st.st_size / (1024 * 1024), 2),
+            "modified": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+            "title": job.get("title") or "",
+            "creator": job.get("creator") or "",
+            "url": f"/media/{f.name}",
+            "public_url": f"{cfg('PUBLIC_BASE_URL').rstrip('/')}/media/{f.name}" if cfg("PUBLIC_BASE_URL") else f"/media/{f.name}",
+            "in_memory": job_id in JOBS,
+        })
+    return {"videos": items, "count": len(items)}
+
+
+@app.post("/api/videos/select")
+def select_video(body: JobIn, request: Request):
+    """Load an existing local video into the active job so it can be captioned/published."""
+    path = MEDIA / f"{body.job_id}.mp4"
+    if not path.exists():
+        raise HTTPException(404, "Video file nahi mili.")
+    job = JOBS.get(body.job_id)
+    if not job:
+        job = {
+            "id": body.job_id,
+            "title": "",
+            "creator": "",
+            "duration": None,
+            "video_url": f"/media/{body.job_id}.mp4",
+            "catbox_url": public_media_url(body.job_id, request),
+            "caption": "",
+            "results": {},
+        }
+        JOBS[body.job_id] = job
+    else:
+        # refresh public url
+        job["catbox_url"] = public_media_url(body.job_id, request)
+        job["video_url"] = f"/media/{body.job_id}.mp4"
+    return job
+
+
+@app.post("/api/videos/delete-all")
+def delete_all_videos():
+    """Delete every local video file and clear in-memory jobs."""
+    n = 0
+    for f in list(MEDIA.glob("*.mp4")):
+        try:
+            f.unlink()
+            n += 1
+        except OSError:
+            pass
+    JOBS.clear()
+    return {"ok": True, "deleted_files": n}
+
 
 @app.post("/api/delete")
 def delete_job(body: JobIn):

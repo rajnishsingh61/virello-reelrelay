@@ -14,10 +14,15 @@ function App(){
   const [channels,setChannels]=useState([]), [ig,setIg]=useState(''), [yt,setYt]=useState('');
   const [busy,setBusy]=useState(''), [error,setError]=useState(''), [note,setNote]=useState('');
   const [approved,setApproved]=useState(false), [rights,setRights]=useState(false), [schedule,setSchedule]=useState('now');
+  const [videos,setVideos]=useState([]);
   const [loginNeeded,setLoginNeeded]=useState(false), [password,setPassword]=useState('');
-  useEffect(()=>{ (async()=>{try{const a=await api('/api/auth'); if(a.needs_password&&!a.logged_in){setLoginNeeded(true);if(!a.configured)setError('APP_PASSWORD is not configured on the server yet. Set it in Render Environment Variables.');return;} await refreshConfig();}catch(e){setError(e.message)}})(); },[]);
+  useEffect(()=>{ (async()=>{try{const a=await api('/api/auth'); if(a.needs_password&&!a.logged_in){setLoginNeeded(true);if(!a.configured)setError('APP_PASSWORD is not configured on the server yet. Set it in Render Environment Variables.');return;} await refreshConfig(); try{const d=await api('/api/videos');setVideos(d.videos||[])}catch(_){}}catch(e){setError(e.message)}})(); },[]);
   async function refreshConfig(){const c=await api('/api/config');setCfg(c);}
   async function login(e){e.preventDefault();setError('');setBusy('login');try{await api('/api/login',{password});setLoginNeeded(false);await refreshConfig()}catch(e){setError(e.message)}finally{setBusy('')}}
+  async function loadVideos(){try{const d=await api('/api/videos');setVideos(d.videos||[])}catch(e){/* silent */}}
+  async function selectVideo(id){setBusy('fetch');setError('');setNote('');try{const d=await api('/api/videos/select',{job_id:id});setJob(d);setCaption(d.caption||'');setApproved(false);setNote('Existing video loaded.');await loadVideos()}catch(e){setError(e.message)}finally{setBusy('')}}
+  async function deleteVideo(id){setBusy('clear');try{await api('/api/delete',{job_id:id});if(job?.id===id){setJob(null);setCaption('');setApproved(false)}setNote('Video deleted.');await loadVideos()}catch(e){setError(e.message)}finally{setBusy('')}}
+  async function deleteAllVideos(){if(!confirm('Delete ALL local videos?'))return;setBusy('clear');try{await api('/api/videos/delete-all',{});setJob(null);setCaption('');setApproved(false);setVideos([]);setNote('All videos deleted.')}catch(e){setError(e.message)}finally{setBusy('')}}
   async function clearJob(){if(!job)return;setBusy('clear');setError('');setNote('');try{await api('/api/delete',{job_id:job.id});setJob(null);setCaption('');setApproved(false);setNote('Video deleted.')}catch(e){setError(e.message)}finally{setBusy('')}}
   async function loadChannels(){setBusy('channels');setError('');setNote('');try{const d=await api('/api/buffer/channels',{});setChannels(d.channels||[]);const instagram=(d.channels||[]).find(c=>/instagram/i.test(c.service+' '+c.name));const youtube=(d.channels||[]).find(c=>/youtube/i.test(c.service+' '+c.name));if(instagram)setIg(instagram.id);if(youtube)setYt(youtube.id);setNote(`${(d.channels||[]).length} Buffer channel(s) loaded. Select the correct Instagram and YouTube channels below.`)}catch(e){setError(e.message)}finally{setBusy('')}}
   async function fetchVideo(e){e.preventDefault();setBusy('fetch');setError('');setNote('');setJob(null);setCaption('');setApproved(false);try{const d=await api('/api/fetch',{url});setJob(d);setNote('Video downloaded and uploaded to Catbox. Review it before continuing.');}catch(e){setError(e.message)}finally{setBusy('')}}
@@ -34,7 +39,30 @@ function App(){
       <div className="panel sourcePanel"><div className="panelHead"><div className="stepIcon"><Link2/></div><div><h2>Import a video</h2><p>Paste a supported video URL</p></div><span className="stepPill">STEP 01</span></div><form onSubmit={fetchVideo}><label htmlFor="videoUrl">VIDEO LINK</label><div className="inputWrap"><Link2 size={17}/><input id="videoUrl" value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://www.tiktok.com/..." required/></div><button className="primary full" disabled={busy==='fetch'}>{busy==='fetch'?<><LoaderCircle className="spin" size={18}/> Downloading & uploading…</>:<>Fetch video <ArrowRight size={18}/></>}</button></form><div className="privacyLine"><ShieldCheck size={16}/> Only upload content you own or have permission to repost.</div>
       {job&&<div className="videoCard"><video controls playsInline src={job.video_url}/><div className="videoMeta"><div><b>{job.title||'Video ready for review'}</b><span>{job.duration?`${job.duration}s · `:''}{job.creator?`Creator @${job.creator}`:'Imported video'}</span></div><span className="successBadge"><Check size={13}/> VIDEO READY</span><button className="secondary small" style={{marginLeft:8}} disabled={busy==='clear'} onClick={clearJob}>Delete video</button></div>{job.catbox_url&&<a className="urlLine" href={job.catbox_url} target="_blank" rel="noreferrer">Public video URL <ArrowRight size={14}/></a>}</div>}
       </div>
-      <div className="panel captionPanel"><div className="panelHead"><div className="stepIcon purple"><Sparkles/></div><div><h2>Caption studio</h2><p>AI hook, context and hashtags</p></div><span className="stepPill">STEP 02</span></div><button className="secondary full" disabled={!job||busy==='caption'||!cfg?.llm} onClick={generateCaption}>{busy==='caption'?<><LoaderCircle className="spin" size={18}/> Generating…</>:<><Sparkles size={17}/> Generate caption with AI</>}</button><label htmlFor="caption">CAPTION + HASHTAGS</label><textarea id="caption" value={caption} onChange={e=>{setCaption(e.target.value);setApproved(false)}} placeholder="Generate a caption or write your own. Add relevant hashtags…" maxLength={2200}/><div className="captionFooter"><span>{caption.length}/2200 characters</span><button className={'approveBtn '+(approved?'approved':'')} onClick={()=>{setApproved(true);setNote('Caption approved. Choose your Buffer channels below.')}} disabled={!caption.trim()}>{approved?<><Check size={15}/> Approved</>:<>Approve caption <Check size={15}/></>}</button></div></div>
+      
+    <section className="panel">
+      <div className="panelHead"><div className="stepIcon"><FileVideo/></div><div><h2>Video library</h2><p>Local files on this server (file manager)</p></div>
+        <div style={{display:'flex',gap:8}}>
+          <button className="secondary" onClick={loadVideos} disabled={busy}>Refresh</button>
+          <button className="secondary" onClick={deleteAllVideos} disabled={!videos.length||busy}>Delete all</button>
+        </div>
+      </div>
+      {videos.length===0?<p style={{opacity:.6,margin:0}}>No videos yet. Fetch a TikTok link above.</p>:
+        <div style={{display:'flex',flexDirection:'column',gap:8}}>
+          {videos.map(v=>(
+            <div key={v.id} style={{display:'flex',alignItems:'center',gap:12,padding:'10px 12px',borderRadius:12,background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.06)'}}>
+              <FileVideo size={18} style={{flexShrink:0,opacity:.7}}/>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontWeight:600,fontSize:13,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{v.title||v.filename}</div>
+                <div style={{fontSize:11,opacity:.55}}>{v.size_mb} MB · {v.modified}{v.creator?` · @${v.creator}`:''}</div>
+              </div>
+              <button className="secondary small" disabled={busy} onClick={()=>selectVideo(v.id)}>Use</button>
+              <button className="secondary small" disabled={busy} onClick={()=>deleteVideo(v.id)}>Delete</button>
+            </div>
+          ))}
+        </div>}
+    </section>
+<div className="panel captionPanel"><div className="panelHead"><div className="stepIcon purple"><Sparkles/></div><div><h2>Caption studio</h2><p>AI hook, context and hashtags</p></div><span className="stepPill">STEP 02</span></div><button className="secondary full" disabled={!job||busy==='caption'||!cfg?.llm} onClick={generateCaption}>{busy==='caption'?<><LoaderCircle className="spin" size={18}/> Generating…</>:<><Sparkles size={17}/> Generate caption with AI</>}</button><label htmlFor="caption">CAPTION + HASHTAGS</label><textarea id="caption" value={caption} onChange={e=>{setCaption(e.target.value);setApproved(false)}} placeholder="Generate a caption or write your own. Add relevant hashtags…" maxLength={2200}/><div className="captionFooter"><span>{caption.length}/2200 characters</span><button className={'approveBtn '+(approved?'approved':'')} onClick={()=>{setApproved(true);setNote('Caption approved. Choose your Buffer channels below.')}} disabled={!caption.trim()}>{approved?<><Check size={15}/> Approved</>:<>Approve caption <Check size={15}/></>}</button></div></div>
     </section>
     <section className="panel publishPanel"><div className="panelHead"><div className="stepIcon green"><CloudUpload/></div><div><h2>Publish with Buffer</h2><p>No direct Meta or YouTube upload API calls from ReelRelay</p></div><span className="stepPill">STEP 03</span></div>
       <div className="connectRow"><div><b>Connected channels</b><span>Load channels from your Buffer account</span></div><button className="secondary" onClick={loadChannels} disabled={busy==='channels'||!cfg?.buffer_key}>{busy==='channels'?<LoaderCircle className="spin" size={16}/>:<RefreshCw size={16}/>} Load channels</button></div>
