@@ -26,7 +26,10 @@ MEDIA = BASE / "media"
 MEDIA.mkdir(exist_ok=True)
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
-TIKTOK_RE = re.compile(r"https?://\S*tiktok\.com\S*", re.I)
+TIKTOK_RE = re.compile(
+    r"(?:https?://(?:(?:www|vt|vm|m)\.)?tiktok\.com/\S+)|(?:^\d{15,25}$)",
+    re.I,
+)
 MEDIA_MAX_AGE = 24 * 3600  # keep local files up to 24h for file manager list
 MAX_VIDEO_BYTES = 200 * 1024 * 1024  # safety limit for local storage
 
@@ -254,44 +257,93 @@ def catbox_upload(path: Path) -> str:
     return public_url
 
 
+def tikwm_headers() -> dict:
+    """Official TikWM auth: x-tikwmapi-key header on every request."""
+    key = cfg("TIKWMAPI_KEY")
+    if not key:
+        raise HTTPException(400, "config.py mein TIKWMAPI_KEY bharo. Dashboard: https://tikwmapi.com/dashboard/keys")
+    return {
+        **UA,
+        "x-tikwmapi-key": key,
+        "Accept": "application/json",
+    }
+
+
+def tikwm_get_video(url_or_id: str) -> dict:
+    """
+    Official Get Video Detail — GET https://api.tikwmapi.com/
+    Docs: https://tikwmapi.com/docs.html#overview
+    Params: url (required), hd=1 for data.hdplay
+    Auth: header x-tikwmapi-key
+    """
+    r = httpx.get(
+        "https://api.tikwmapi.com/",
+        params={"url": url_or_id, "hd": "1"},
+        headers=tikwm_headers(),
+        timeout=90,
+        verify=False,
+    )
+    # HTTP 429 → rate limit or quota (codes 10429 / 10430 in body)
+    if r.status_code == 429:
+        try:
+            body = r.json()
+            msg = body.get("msg") or "Rate limit / quota exceeded"
+            code = body.get("code")
+        except Exception:
+            msg, code = r.text[:200], None
+        reset = r.headers.get("x-ratelimit-reset") or r.headers.get("x-ratelimit-quota-reset")
+        extra = f" (reset in {reset}s)" if reset else ""
+        raise HTTPException(429, f"TikWM: {msg}{extra}")
+
+    try:
+        payload = r.json()
+    except Exception:
+        raise HTTPException(502, f"TikWM ne invalid JSON diya (HTTP {r.status_code})")
+
+    code = payload.get("code")
+    msg = payload.get("msg") or ""
+    if code == 10401:
+        raise HTTPException(502, "TikWM API key missing/invalid. TIKWMAPI_KEY check karo.")
+    if code in (10429, 10430):
+        raise HTTPException(429, f"TikWM: {msg or 'rate limit / quota'}")
+    if code != 0:
+        raise HTTPException(404, msg or f"TikWM error code={code}")
+
+    data = payload.get("data") or {}
+    # Prefer HD no-watermark, then standard play
+    video_src = data.get("hdplay") or data.get("play") or data.get("wmplay")
+    if not video_src:
+        # image carousel / story without video
+        if data.get("images"):
+            raise HTTPException(400, "Yeh photo/carousel post hai, video nahi. Sirf video URL support hai.")
+        raise HTTPException(404, "TikWM se video download URL nahi mili.")
+    if video_src.startswith("/"):
+        video_src = "https://www.tikwm.com" + video_src
+    data["_video_src"] = video_src
+    return data
+
+
 @app.post("/api/fetch")
 def fetch_video(body: UrlIn, request: Request):
     cleanup_media()
-    m = TIKTOK_RE.fullmatch(body.url.strip())
+    raw = body.url.strip()
+    m = TIKTOK_RE.fullmatch(raw) or TIKTOK_RE.search(raw)
     if not m:
-        raise HTTPException(400, "Abhi supported TikTok video URL daalo.")
-    try:
-        tikwm_key = cfg("TIKWMAPI_KEY")
-        if not tikwm_key:
-            raise HTTPException(400, "config.py mein TIKWMAPI_KEY bharo.")
-        r = httpx.get(
-            "https://api.tikwmapi.com/",
-            params={"url": m.group(0), "hd": "1"},
-            headers={**UA, "x-tikwmapi-key": tikwm_key, "Accept": "application/json"},
-            timeout=60,
-            verify=False,
+        raise HTTPException(
+            400,
+            "Valid TikTok URL ya video ID daalo. "
+            "Example: https://vt.tiktok.com/ZSxxx/ ya https://www.tiktok.com/@user/video/123..."
         )
-        if r.status_code == 429:
-            raise HTTPException(429, "TikWM rate limit/quota reached. Thodi der baad try karo ya plan quota check karo.")
-        r.raise_for_status()
-        payload = r.json()
+    url_or_id = m.group(0)
+
+    try:
+        data = tikwm_get_video(url_or_id)
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(502, f"TikWM API se jawab nahi aaya: {str(e)[:250]}")
+        raise HTTPException(502, f"TikWM API fail: {str(e)[:250]}")
 
-    data = payload.get("data") or {}
-    src = data.get("hdplay") or data.get("play")
-    if payload.get("code") != 0 or not src:
-        code = payload.get("code")
-        message = payload.get("msg") or "Video nahi mili."
-        if code == 10401:
-            raise HTTPException(502, "TikWM API key invalid ya missing hai. TIKWMAPI_KEY check karo.")
-        if code in (10429, 10430):
-            raise HTTPException(429, f"TikWM quota/rate limit: {message}")
-        raise HTTPException(404, message)
-    if src.startswith("/"):
-        src = "https://www.tikwm.com" + src
+    src = data["_video_src"]
 
     job_id = uuid.uuid4().hex[:10]
     raw_path = MEDIA / f"{job_id}_raw.mp4"
@@ -326,9 +378,18 @@ def fetch_video(body: UrlIn, request: Request):
         raise HTTPException(502, f"Download fail hua: {str(e)[:250]}")
 
     author = data.get("author") or {}
-    job = {"id": job_id, "title": data.get("title") or "", "creator": author.get("unique_id") or "",
-           "duration": data.get("duration"), "video_url": f"/media/{job_id}.mp4",
-           "catbox_url": public_url, "caption": "", "results": {}}
+    creator = author.get("unique_id") or author.get("nickname") or ""
+    job = {
+        "id": job_id,
+        "title": data.get("title") or data.get("desc") or "",
+        "creator": creator,
+        "duration": data.get("duration"),
+        "video_url": f"/media/{job_id}.mp4",
+        "catbox_url": public_url,
+        "caption": "",
+        "results": {},
+        "tikwm_id": str(data.get("id") or data.get("aweme_id") or ""),
+    }
     JOBS[job_id] = job
     return job
 
